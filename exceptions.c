@@ -179,8 +179,36 @@ void sysBpHandler(){
 
 	}else if ( cause == EXC_BREAKPOINT ){ //caso breakpoint
 
+		//Visto che anche qui non sono sicura in che modalità sono, supponiamo di essere in kernel mode, stoppo il tempo utente
+		currentProcess->p_userTime += getTODLO() - userTimeStart;
+
+		if (currentProcess->p_excpvec[EXCP_SYS_NEW]!=NULL){//vuol dire che era stata chiamata la sys4
+			state_t *proc_new_area = currentProcess->p_excpvec[EXCP_SYS_NEW];
+			state_t *proc_old_area = currentProcess->p_excpvec[EXCP_SYS_OLD];
+			// The processor state is moved from the SYS/Bp Old Area into the processor state stored in the ProcBlk as the SYS/Bp Old Area
+			copyState(proc_old_area, sysBp_old);
+
+			//the four parameter register (a1-a4) are copied from SYS/Bp Old Area to the ProcBlk SYS/Bp New Area
+			proc_new_area->a1=sysBp_old->a1;
+			proc_new_area->a2=sysBp_old->a2;
+			proc_new_area->a3=sysBp_old->a3;
+			proc_new_area->a4=sysBp_old->a4;
+
+			//the lower 4 bits of SYS/Bp Old Area’s cpsr register are copied in the most significant positions of ProcBlk SYS/Bp New Area’s a1 register.
+			/*questo per ora non lo so fare*/
+
+			//Finally, the processor state stored in the ProcBlk as the SYS/Bp New Area is made the current processor state.
+			LDST(proc_new_area);
+		}else{//non è stata fatta la sys4
+
+			terminateProcess(0);
+
+		}
 
 
+
+	}else { //non è ne syscall ne breakpoint
+		PANIC();
 	}
 }
 
@@ -235,18 +263,10 @@ void terminateProcess(pid_t pid){
 			pid = currentProcess->p_pid;
 			isSuicide = TRUE;
 		}
-		else{
-			isSuicide = TRUE;
-		}
 	}
-
-	/* Quello di prima era più leggibile quindi lo lascio qui, cancella la versione
-	che ti piace di meno
-
-	if((pid == 0) || (currentProcess->p_pid == pid)){
-		pid = currentProcess->p_pid;
-		isSuicide = TRUE;
-	}*/
+	else{
+			isSuicide = TRUE;
+	}
 
 	/* Recupera nella tabella dei pcb usati quello da rimuovere */
 	pToKill = active_pcb[pid-1]; //ancora non so come fare con i puntatori
@@ -319,13 +339,16 @@ void semaphoreOperation (int *semaddr, int weight){
 
 		(*semaddr) += weight;
 		if(weight > 0){ //abbiamo liberato risorse
-			if(*semaddr >= 0){
+			if(*semaddr >= 0){ // questo è il controllo che forse dovremmo togliere 26/08
 
 				// Se sem > risorse richieste dal primo bloccato --> sblocco processo
 				pcb_t *p;
 				p=headBlocked(semaddr);
 				if(p!=NULL){
-					if(p->p_resource<=weight || p->p_resource <= *semaddr){
+					if (p->p_resource > weight){
+						p->p_resource = p->p_resource - weight;
+					}
+					else if(p->p_resource<=weight){
 						p = removeBlocked(semaddr);
 						if (p != NULL){
 							p->p_resource=0;
@@ -341,7 +364,7 @@ void semaphoreOperation (int *semaddr, int weight){
 
 			//se il semaforo era o diventa negativo ci blocchiamo, altrimenti modifichiamo il valore del semaforo
 
-			if  (*semaddr <= 0)  {
+			if  (*semaddr < 0)  {
 				if(insertBlocked(semaddr, currentProcess))
 					PANIC();	//currentProcess è dell'initial???
 
@@ -464,6 +487,120 @@ void getCpuTime(cputime_t *global, cputime_t *user){
 
  }
 
+//I/O Device Operation (SYS10)
+void ioDevOp(unsigned int command, int intlNo, unsigned int dnum){
+
+	int dev; //perchè ci serve?
+	dtpreg_t devReg; //registri dei device normali
+	termreg_t termReg; //registro del terminale
+	int is_read;
+
+	if(dnum >= 0)&&(dnum < N_DEV_PER_IL){//caso accesso a device tranne scrittura su terminale
+		dev = intlNo - DEV_IL_START; //in arch.h: DEV_IL_START (N_INTERRUPT_LINES - N_EXT_IL) --> 8-5 = 3
+
+		is_read = FALSE;
+	}
+	else{
+		if(dnum & 0x10000000){// caso scrittura su terminale
+			dev = N_EXT_IL;
+			dnum = dnum & 0x00000111;
+
+			is_read = TRUE;
+		}
+		else{ //abbiamo chiamato la sys10 con un dnum che non esiste
+			PANIC();
+		}
+	}
+
+	if (intlNo == IL_TERMINAL){//gestione interrupt terminale
+
+		// puntatori ai campi della struttura
+		unsigned int *recvStatus, *recvCommand, *transmStatus, *transmCommand; //i vari campi dei device register sono grandi 4, suppongo che anche l'int sia grande 4, al massimo cambiamo
+
+		termReg=DEV_REG_ADDR(intlNo, dnum);
+
+		recvStatus = termReg;
+		recvCommand = termReg + 0x4;
+		transmStatus = termReg + 0x8;
+		transmCommand = termReg + 0xC;
+
+		//A terminal operation is started by loading the appropriate value(s) into the
+		//TRANSM COMMAND or RECV COMMAND field.
+		*command=command;//non so se si può fare
+		if(is_read){//dobbiamo leggere/ricevere
+			*recvCommand==2; //dico che deve trasmettere/ricevere
+			/*A character is received, and placed in RECV STATUS.RECVD-CHAR only after
+			a RECEIVECHAR command has been issued to the receiver.*/
+			RECEIVECHAR(); //non so dove sia.
+			if(*recvStatus==5){
+				/* ricezione andata a buon fine */
+
+				/*Upon completion of the operation an
+interrupt is raised and an appropriate status code is set in TRANSM STATUS or
+RECV STATUS respectively;*/
+
+				/* Solleviamo un interrupt e poi l'interrupt handler vedrà che
+				siamo noi e ci manda un ACK*/
+			}
+		}
+		else{//dobbiamo scrivere/trasmettere
+			*transmCommand==2; //dico che deve trasmettere/ricevere
+
+			/* Fare qualcosa per trasmettere */
+
+			if(*transmStatus==5){
+				/* scrittura andata a buon fine */
+			}
+		}
+	}
+	else{ // gestione interrupt altri device
+
+		//puntatori ai campi della struttura.
+		unsigned int *status, *command, *data0, *data1; //i vari campi dei device register sono grandi 4, suppongo che anche l'int sia grande 4, al massimo cambiamo
+
+		devReg=DEV_REG_ADDR(intlNo, dnum);
+		status = devReg;
+		command = devReg + 0x4;
+		data0 = devReg + 0x8;
+		data1 = devReg + 0xC;
+
+
+		if(status == 1){//il device è ready
+
+		}
+	}
+
+	/* -------------- Cose di Olga: -----------------------
+	//controllo se è lettura o scrittura del terminale
+	if ( dnum & 0x10000000 ) { // vero sse il bit più significativo era acceso
+		dev = N_EXT_IL+1;
+		dnum = dnum & 0x10000111;
+		is_read = TRUE;
+	}else{
+		dev = intlNo - DEV_IL_START; //in arch.h: DEV_IL_START (N_INTERRUPT_LINES - N_EXT_IL) --> 8-5 = 3
+		is_read = FALSE;
+	}
+
+	if (intlNo == IL_TERMINAL){//azioni su terminali
+		termReg=DEV_REG_ADDR(intlNo, dnum);
+		if (is_read){
+			//se leggo il comando va messo in quello che riceve o in quello che legge????
+			termReg->recv_command=command;
+		}else{
+			termReg->transm_status=command;
+		}
+
+	}else{//azioni su altri device
+		devReg=DEV_REG_ADDR(intlNo, dnum);
+		devReg->command=command;
+	}
+
+	//basta quello che ho fatto sopra per "performare" il comando?
+
+	//la cosa seguente in teoria dovrebbe bloccare il currentProcess nel semaforo del device giusto ma boh
+	semaphoreOperation(&devices[dev][dnum]; -1);
+	*/
+}
 
 
 // Get Process ID SYS11
@@ -476,8 +613,70 @@ pid_t getPid(){
 
 void pgmTrapHandler(){
 
+	currentProcess->p_userTime += getTODLO() - userTimeStart;
+	state_t *pgmTrap_old = (state_t *) PGMTRAP_OLDAREA ;
+
+	//Ci serve la causa e le specifiche dicono che la trovo in CP15_Cause.excCode, quindi per recuperare la causa uso la macro che segue (non sono sicura di come funziona la macro, quindi faccio come avevano fatto i tipi di cui mi fido nella sys/bp handler)
+	unsigned int cause= getCAUSE(); //dice che manipola il Cause register delle eccezzioni, però non so
+	cause= CAUSE_EXCCODE_GET(cause);
+
+/*-----------------Metodo alternativo-----------------
+
+	unsigned int cause= pgmTrap_old->CP15_Cause;
+	cause=CAUSE_EXCCODE_GET(cause);
+
+	*/
+
+
+	if (currentProcess->p_excpvec[EXCP_PGMT_NEW]!=NULL){//vuol dire che era stata chiamata la sys5
+		state_t *proc_new_area = currentProcess->p_excpvec[EXCP_PGMT_NEW];
+		state_t *proc_old_area = currentProcess->p_excpvec[EXCP_PGMT_OLD];
+		// The processor state is moved from the PgmTrap Old Area into the processor state stored in the ProcBlk as the PgmTrap Old Area
+		copyState(proc_old_area, pgmTrap_old);
+
+		//and Cause register is copied from the PgmTrap Old Area into the ProcBlk PgmTrap New Area’s a1 register.
+		proc_new_area->a1=cause;
+
+		//Finally, the processor state stored in the ProcBlk as the SYS/Bp New Area is made the current processor state.
+		LDST(proc_new_area);
+	}else{//non è stata fatta la sys5
+
+		terminateProcess(0);
+
+	}
+
 }
 
 void tlbHandler(){
+	currentProcess->p_userTime += getTODLO() - userTimeStart;
+	state_t *tlb_old = (state_t *) TLB_OLDAREA ;
 
+	//Ci serve la causa e le specifiche dicono che la trovo in CP15_Cause.excCode, quindi per recuperare la causa uso la macro che segue (non sono sicura di come funziona la macro, quindi faccio come avevano fatto i tipi di cui mi fido nella sys/bp handler)
+	unsigned int cause= getCAUSE(); //dice che manipola il Cause register delle eccezzioni, però non so
+	cause= CAUSE_EXCCODE_GET(cause);
+
+	/*-----------------Metodo alternativo-----------------
+
+	unsigned int cause= tlb_old->CP15_Cause;
+	cause=CAUSE_EXCCODE_GET(cause);
+
+	*/
+
+
+	if (currentProcess->p_excpvec[EXCP_TLB_NEW]!=NULL){//vuol dire che era stata chiamata la sys5
+		state_t *proc_new_area = currentProcess->p_excpvec[EXCP_TLB_NEW];
+		state_t *proc_old_area = currentProcess->p_excpvec[EXCP_TLB_OLD];
+		// The processor state is moved from the tlb Old Area into the processor state stored in the ProcBlk as the TLB Old Area
+		copyState(proc_old_area, tlb_old);
+
+		//and Cause register is copied from the TLB Old Area into the ProcBlk TLB New Area’s a1 register.
+		proc_new_area->a1=cause;
+
+		//Finally, the processor state stored in the ProcBlk as the SYS/Bp New Area is made the current processor state.
+		LDST(proc_new_area);
+	}else{//non è stata fatta la sys5
+
+		terminateProcess(0);
+
+	}
 }
